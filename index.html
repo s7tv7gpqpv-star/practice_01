@@ -1,0 +1,770 @@
+import React, { useEffect, useMemo, useRef, useState } from "react";
+
+// NOTE:
+// - Single-file React app (default export one component)
+// - No external images/files
+// - GSAP-like animations implemented with lightweight in-file helpers (no dependency)
+
+const STORAGE_KEY = "english_moment_log_v1";
+
+function uid() {
+  return `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function safeJsonParse(str, fallback) {
+  try {
+    const v = JSON.parse(str);
+    return v ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function escapeCSVCell(value) {
+  const s = String(value ?? "");
+  if (/[\n\r\",]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+  return s;
+}
+
+function downloadText(filename, text, mime = "text/csv;charset=utf-8") {
+  const blob = new Blob([text], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+// --- Minimal GSAP-ish helpers (no external dependency) ---
+// Supports: fade/slide in on mount, and a small "pop" feedback.
+function animateIn(el, { yFrom = 10, duration = 520, delay = 0 } = {}) {
+  if (!el) return;
+  el.animate(
+    [
+      { opacity: 0, transform: `translateY(${yFrom}px)` },
+      { opacity: 1, transform: "translateY(0px)" },
+    ],
+    {
+      duration,
+      delay,
+      easing: "cubic-bezier(0.2, 0.8, 0.2, 1)",
+      fill: "both",
+    }
+  );
+}
+
+function popFeedback(el) {
+  if (!el) return;
+  el.animate(
+    [
+      { transform: "scale(1)", filter: "brightness(1)" },
+      { transform: "scale(1.02)", filter: "brightness(1.15)" },
+      { transform: "scale(1)", filter: "brightness(1)" },
+    ],
+    {
+      duration: 260,
+      easing: "cubic-bezier(0.2, 0.8, 0.2, 1)",
+    }
+  );
+}
+
+// --- Rule-based suggestion engine ---
+function normalizeKorean(s) {
+  return String(s || "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .toLowerCase();
+}
+
+function containsAny(text, arr) {
+  return arr.some((k) => text.includes(k));
+}
+
+function buildSuggestions({ situation, counterpart, tone, ko, memo }) {
+  const t = normalizeKorean(ko);
+
+  // Helpers for softening / tone
+  const isFormal = tone === "정중";
+  const isFirm = tone === "단호";
+  const isCasual = tone === "캐주얼";
+
+  const prefix = isFormal ? "I’m afraid" : "";
+  const please = isFormal ? "please" : "";
+
+  const ctxHints = {
+    카톡: "(via text)",
+    수업: "(in class)",
+    여행: "(while traveling)",
+    알바: "(at work)",
+    SNS: "(online)",
+  };
+
+  const ctx = ctxHints[situation] || "";
+
+  // Fallback templates
+  const fallback = {
+    good: isFormal
+      ? `Could you give me a moment to think about it? ${ctx}`.trim()
+      : `Give me a moment to think. ${ctx}`.trim(),
+    natural: isFormal
+      ? `Let me get back to you shortly. ${ctx}`.trim()
+      : `Let me get back to you in a bit. ${ctx}`.trim(),
+    casual: `Hold on—let me check. ${ctx}`.trim(),
+    dont: `I can’t, because it’s awkward. ${ctx}`.trim(),
+    whyDont:
+      "직역 느낌(awkward/ambiguous)을 이유로 내세우면 이상하게 들릴 때가 많음. 대신 '잠깐 확인할게/지금은 어렵다/나중에'처럼 행동 중심으로 말하는 게 안전함.",
+  };
+
+  // Rule groups
+  // 1) "나중에" / postpone
+  if (containsAny(t, ["나중에", "나중에요", "이따", "좀 있다", "나중에 할게", "나중에 할께", "나중에 할게요"])) {
+    const base = isFormal
+      ? "Could we do this a bit later?"
+      : "Can we do this later?";
+    const natural = isFormal
+      ? "Would it be okay if we did this later?"
+      : "Let’s do it later.";
+    const casual = "Later—I'll text you.";
+    const dont = "Do it later.";
+    return {
+      good: `${base} ${ctx}`.trim(),
+      natural: `${natural} ${ctx}`.trim(),
+      casual: `${casual} ${ctx}`.trim(),
+      dont: `${dont} ${ctx}`.trim(),
+      whyDont:
+        "'Do it later.'는 명령처럼 들리거나 냉정하게 들릴 수 있음. 요청/합의 형태로 바꾸는 게 안전함.",
+    };
+  }
+
+  // 2) "지금은 어렵다" / can't now
+  if (containsAny(t, ["지금은", "지금", "어렵", "힘들", "안 돼", "못 해", "못하", "불가능"])) {
+    const good = isFormal
+      ? `${prefix} I can’t do it right now. ${ctx}`.trim()
+      : `I can’t right now. ${ctx}`.trim();
+    const natural = isFormal
+      ? `I’m not able to right now. Could we do it later? ${ctx}`.trim()
+      : `I can’t right now—can we do it later? ${ctx}`.trim();
+    const casual = `Not right now. Maybe later? ${ctx}`.trim();
+    const dont = `I’m impossible right now. ${ctx}`.trim();
+    return {
+      good,
+      natural,
+      casual,
+      dont,
+      whyDont: "'I’m impossible'은 비문에 가깝고 의미가 어색함. 'I can’t' / 'I’m not able to'가 자연스러움.",
+    };
+  }
+
+  // 3) "미안" / apology
+  if (containsAny(t, ["미안", "죄송", "죄송해", "죄송합니다", "미안해"])) {
+    const good = isFormal
+      ? `I’m sorry about that. ${ctx}`.trim()
+      : `Sorry about that. ${ctx}`.trim();
+    const natural = isFormal
+      ? `I apologize for the inconvenience. ${ctx}`.trim()
+      : `My bad—sorry. ${ctx}`.trim();
+    const casual = `Oops, sorry! ${ctx}`.trim();
+    const dont = `I regret you. ${ctx}`.trim();
+    return {
+      good,
+      natural,
+      casual,
+      dont,
+      whyDont: "'I regret you'는 상대를 후회한다는 이상한 뜻이 됨. 'I’m sorry' / 'My bad'를 써야 함.",
+    };
+  }
+
+  // 4) "고마워" / thanks
+  if (containsAny(t, ["고마", "감사", "감사해", "감사합니다", "땡큐"])) {
+    const good = isFormal
+      ? `Thank you. I appreciate it. ${ctx}`.trim()
+      : `Thanks—I appreciate it. ${ctx}`.trim();
+    const natural = isFormal
+      ? `Thanks so much for your help. ${ctx}`.trim()
+      : `Thanks a lot—really. ${ctx}`.trim();
+    const casual = `Thanks! You’re the best. ${ctx}`.trim();
+    const dont = `I’m thankful. ${ctx}`.trim();
+    return {
+      good,
+      natural,
+      casual,
+      dont,
+      whyDont: "'I’m thankful'도 틀린 건 아니지만 단독으로 툭 던지면 어색할 때가 많음. 'Thanks'/'I appreciate it'가 안전함.",
+    };
+  }
+
+  // 5) "애매해/미묘해" / ambiguous
+  if (containsAny(t, ["애매", "미묘", "뭔가", "그냥", "잘 모르겠", "확실", "헷갈"])) {
+    const good = isFormal
+      ? `I’m not sure yet. Could you clarify a bit? ${ctx}`.trim()
+      : `I’m not sure yet—can you clarify? ${ctx}`.trim();
+    const natural = isFormal
+      ? `I’m a bit unsure. Could you tell me what you mean exactly? ${ctx}`.trim()
+      : `I’m a bit unsure—what exactly do you mean? ${ctx}`.trim();
+    const casual = `Hmm, not sure—what do you mean? ${ctx}`.trim();
+    const dont = `It’s ambiguous, so no. ${ctx}`.trim();
+    return {
+      good,
+      natural,
+      casual,
+      dont,
+      whyDont: "'It’s ambiguous, so no.'는 차갑고 논리 과잉 느낌. '정확히 무슨 뜻인지'를 묻는 게 자연스러움.",
+    };
+  }
+
+  // If no match, return fallback
+  return fallback;
+}
+
+const OPTIONS = {
+  situation: ["카톡", "수업", "여행", "알바", "SNS"],
+  counterpart: ["친구", "선배", "초면", "교수"],
+  tone: ["중립", "정중", "캐주얼", "단호"],
+};
+
+export default function App() {
+  const [form, setForm] = useState({
+    situation: "카톡",
+    counterpart: "친구",
+    tone: "중립",
+    ko: "",
+    memo: "",
+  });
+
+  const [suggestions, setSuggestions] = useState({
+    good: "",
+    natural: "",
+    casual: "",
+    dont: "",
+    whyDont: "",
+  });
+
+  const [logs, setLogs] = useState([]);
+  const [toast, setToast] = useState(null);
+
+  const leftRef = useRef(null);
+  const rightRef = useRef(null);
+  const headerRef = useRef(null);
+  const saveBtnRef = useRef(null);
+
+  // Load logs
+  useEffect(() => {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    const data = safeJsonParse(raw, []);
+    if (Array.isArray(data)) setLogs(data);
+  }, []);
+
+  // Persist logs
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(logs));
+  }, [logs]);
+
+  // Entrance animations
+  useEffect(() => {
+    animateIn(headerRef.current, { yFrom: 14, duration: 560, delay: 40 });
+    animateIn(leftRef.current, { yFrom: 18, duration: 600, delay: 80 });
+    animateIn(rightRef.current, { yFrom: 18, duration: 600, delay: 120 });
+  }, []);
+
+  const canGenerate = useMemo(() => normalizeKorean(form.ko).length > 0, [form.ko]);
+
+  function updateForm(key, value) {
+    setForm((p) => ({ ...p, [key]: value }));
+  }
+
+  function handleGenerate() {
+    const s = buildSuggestions({
+      situation: form.situation,
+      counterpart: form.counterpart,
+      tone: form.tone,
+      ko: form.ko,
+      memo: form.memo,
+    });
+    setSuggestions(s);
+  }
+
+  function handleSave() {
+    const ko = form.ko.trim();
+    if (!ko) {
+      setToast({ type: "warn", msg: "한국어 문장을 먼저 입력해." });
+      return;
+    }
+
+    const item = {
+      id: uid(),
+      createdAt: new Date().toISOString(),
+      situation: form.situation,
+      counterpart: form.counterpart,
+      tone: form.tone,
+      ko: form.ko,
+      memo: form.memo,
+      rec_good: suggestions.good || "",
+      rec_natural: suggestions.natural || "",
+      rec_casual: suggestions.casual || "",
+      rec_dont: suggestions.dont || "",
+      dont_reason: suggestions.whyDont || "",
+    };
+
+    setLogs((prev) => [item, ...prev]);
+    popFeedback(saveBtnRef.current);
+    setToast({ type: "ok", msg: "저장됨" });
+  }
+
+  function copy(text) {
+    const v = String(text || "");
+    if (!v.trim()) return;
+    navigator.clipboard
+      ?.writeText(v)
+      .then(() => setToast({ type: "ok", msg: "복사됨" }))
+      .catch(() => setToast({ type: "warn", msg: "복사 실패 (권한 확인)" }));
+  }
+
+  function remove(id) {
+    setLogs((prev) => prev.filter((x) => x.id !== id));
+  }
+
+  function exportCSV() {
+    const header = [
+      "createdAt",
+      "situation",
+      "counterpart",
+      "tone",
+      "korean",
+      "memo",
+      "Good",
+      "MoreNatural",
+      "Casual",
+      "DontSay",
+      "DontReason",
+    ];
+
+    const rows = logs.map((x) => [
+      x.createdAt,
+      x.situation,
+      x.counterpart,
+      x.tone,
+      x.ko,
+      x.memo,
+      x.rec_good,
+      x.rec_natural,
+      x.rec_casual,
+      x.rec_dont,
+      x.dont_reason,
+    ]);
+
+    const csv = [header, ...rows]
+      .map((r) => r.map(escapeCSVCell).join(","))
+      .join("\n");
+
+    downloadText("english_moment_log.csv", csv);
+  }
+
+  function clearAll() {
+    const ok = window.confirm("진짜 전체 삭제할 거야? (복구 불가)");
+    if (!ok) return;
+    setLogs([]);
+    setToast({ type: "ok", msg: "전체 삭제됨" });
+  }
+
+  // Auto-hide toast
+  useEffect(() => {
+    if (!toast) return;
+    const t = setTimeout(() => setToast(null), 1600);
+    return () => clearTimeout(t);
+  }, [toast]);
+
+  const theme = {
+    bg: "#f8fafc",
+    panel: "#ffffff",
+    panel2: "#ffffff",
+    border: "rgba(15,23,42,0.12)",
+    text: "#0f172a",
+    sub: "#475569",
+    mute: "#64748b",
+    good: "#16a34a",
+    natural: "#2563eb",
+    casual: "#d97706",
+    dont: "#dc2626",
+  };
+
+  const SuggestCard = ({ label, tag, value, onChange, helper }) => {
+    const color =
+      tag === "good"
+        ? theme.good
+        : tag === "natural"
+        ? theme.natural
+        : tag === "casual"
+        ? theme.casual
+        : theme.dont;
+
+    return (
+      <div
+        style={{
+          border: `1px solid ${theme.border}`,
+          background: theme.panel2,
+          borderRadius: 18,
+          padding: 14,
+          boxShadow: "0 10px 30px rgba(0,0,0,0.25)",
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
+          <div
+            style={{
+              width: 10,
+              height: 10,
+              borderRadius: 99,
+              background: color,
+              boxShadow: `0 0 0 4px rgba(255,255,255,0.03), 0 0 14px ${color}33`,
+            }}
+          />
+          <div style={{ fontWeight: 700, letterSpacing: 0.2 }}>{label}</div>
+        </div>
+        <textarea
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder="여기에 추천 문장이 들어와. 눌러서 수정 가능."
+          rows={3}
+          style={{
+            width: "100%",
+            resize: "vertical",
+            background: "rgba(255,255,255,0.03)",
+            border: `1px solid ${theme.border}`,
+            color: theme.text,
+            borderRadius: 14,
+            padding: "10px 12px",
+            outline: "none",
+            lineHeight: 1.35,
+          }}
+        />
+        {helper ? (
+          <div
+            style={{
+              marginTop: 10,
+              color: theme.sub,
+              fontSize: 12.5,
+              lineHeight: 1.4,
+              borderLeft: `3px solid ${theme.border}`,
+              paddingLeft: 10,
+            }}
+          >
+            {helper}
+          </div>
+        ) : null}
+      </div>
+    );
+  };
+
+  return (
+    <div
+      style={{
+        minHeight: "100vh",
+        background: theme.bg,
+        color: theme.text,
+        padding: "26px 16px 36px",
+        fontFamily:
+          "ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, Apple Color Emoji, Segoe UI Emoji",
+      }}
+    >
+      <style>{`
+        * { box-sizing: border-box; }
+        ::selection { background: rgba(96,165,250,0.25); }
+        a { color: inherit; }
+
+        .wrap { max-width: 1160px; margin: 0 auto; }
+        .grid { display: grid; grid-template-columns: 1.08fr 0.92fr; gap: 14px; }
+        @media (max-width: 980px) { .grid { grid-template-columns: 1fr; } }
+
+        .panel { background: #ffffff; border: 1px solid rgba(15,23,42,0.12); border-radius: 22px; box-shadow: 0 12px 30px rgba(15,23,42,0.08); overflow: hidden; }
+        .panelHeader { padding: 16px 18px; display:flex; align-items:center; justify-content:space-between; gap:12px; border-bottom: 1px solid rgba(15,23,42,0.08); background: #ffffff; }
+        .panelBody { padding: 16px 18px 18px; }
+
+        .chip { font-size: 12px; color: #0f172a; padding: 6px 10px; border-radius: 999px; border: 1px solid rgba(15,23,42,0.12); background: #f1f5f9; }
+
+        .label { color: rgba(167,176,192,0.95); font-size: 12.5px; margin-bottom: 6px; }
+        .row { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+        @media (max-width: 560px) { .row { grid-template-columns: 1fr; } }
+
+        select, input, textarea { font: inherit; }
+
+        .field { width:100%; background: #ffffff; border: 1px solid rgba(15,23,42,0.18); color: #0f172a; border-radius: 14px; padding: 10px 12px; outline: none; }
+        .field:focus { border-color: rgba(96,165,250,0.55); box-shadow: 0 0 0 4px rgba(96,165,250,0.14); }
+
+        .btnRow { display:flex; gap:10px; flex-wrap: wrap; align-items:center; }
+        .btn { cursor:pointer; user-select:none; border-radius: 14px; padding: 10px 12px; border: 1px solid rgba(15,23,42,0.18); background: #ffffff; color: #0f172a; font-weight: 700; letter-spacing: 0.2px; }
+        .btn:hover { background: rgba(255,255,255,0.07); }
+        .btn:active { transform: translateY(1px); }
+        .btnPrimary { border-color: rgba(37,99,235,0.45); background: rgba(37,99,235,0.08); }
+        .btnDanger { border-color: rgba(220,38,38,0.45); background: rgba(220,38,38,0.08); }
+        .btnGhost { background: transparent; }
+
+        .cards { display:grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+        @media (max-width: 560px) { .cards { grid-template-columns: 1fr; } }
+
+        .logList { display:flex; flex-direction: column; gap: 10px; }
+        .logItem { border: 1px solid rgba(148,163,184,0.18); background: rgba(11,18,36,0.66); border-radius: 18px; padding: 12px; }
+        .logMeta { display:flex; gap:8px; flex-wrap: wrap; align-items:center; margin-bottom: 8px; }
+        .logKo { white-space: pre-wrap; line-height: 1.35; font-weight: 650; margin-bottom: 8px; }
+        .logEn { white-space: pre-wrap; line-height: 1.35; color: rgba(229,231,235,0.92); }
+        .logMemo { white-space: pre-wrap; line-height: 1.35; color: rgba(167,176,192,0.95); font-size: 12.5px; margin-top: 8px; }
+
+        .small { font-size: 12px; color: rgba(167,176,192,0.95); }
+
+        .toast { position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%); padding: 10px 12px; border-radius: 999px; border: 1px solid rgba(148,163,184,0.18); background: rgba(15,23,42,0.85); box-shadow: 0 14px 40px rgba(0,0,0,0.35); display:flex; align-items:center; gap: 10px; z-index: 9999; }
+        .dot { width: 8px; height: 8px; border-radius: 999px; }
+
+        .topTitle { display:flex; align-items:flex-start; justify-content:space-between; gap: 14px; }
+        @media (max-width: 560px){ .topTitle { flex-direction: column; } }
+      `}</style>
+
+      <div className="wrap">
+        <div ref={headerRef} className="topTitle" style={{ marginBottom: 14 }}>
+          <div>
+            <div style={{ fontSize: 22, fontWeight: 850, letterSpacing: -0.2 }}>영어 멈칫 로그</div>
+            <div style={{ color: theme.sub, marginTop: 6, lineHeight: 1.35 }}>
+              한국어로 말하려다 멈칫한 순간을 기록하고, 규칙 기반 추천 영어 문장을 바로 저장해.
+            </div>
+          </div>
+        </div>
+
+        <div className="grid">
+          {/* Left: suggestions */}
+          <div ref={leftRef} className="panel">
+            <div className="panelHeader">
+              <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                <div style={{ fontWeight: 850 }}>추천 문장</div>
+                <div className="small">[영어 생성] → 카드 수정 → [저장]</div>
+              </div>
+              <div className="btnRow">
+                <button className={`btn btnPrimary`} onClick={handleGenerate} disabled={!canGenerate}>
+                  영어 생성
+                </button>
+                <button ref={saveBtnRef} className={`btn`} onClick={handleSave}>
+                  저장
+                </button>
+              </div>
+            </div>
+
+            <div className="panelBody">
+              <div className="row" style={{ marginBottom: 12 }}>
+                <div>
+                  <div className="label">상황</div>
+                  <select
+                    className="field"
+                    value={form.situation}
+                    onChange={(e) => updateForm("situation", e.target.value)}
+                  >
+                    {OPTIONS.situation.map((x) => (
+                      <option key={x} value={x}>
+                        {x}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <div className="label">상대</div>
+                  <select
+                    className="field"
+                    value={form.counterpart}
+                    onChange={(e) => updateForm("counterpart", e.target.value)}
+                  >
+                    {OPTIONS.counterpart.map((x) => (
+                      <option key={x} value={x}>
+                        {x}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <div className="label">톤</div>
+                  <select className="field" value={form.tone} onChange={(e) => updateForm("tone", e.target.value)}>
+                    {OPTIONS.tone.map((x) => (
+                      <option key={x} value={x}>
+                        {x}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
+              <div style={{ marginBottom: 12 }}>
+                <div className="label">한국어 문장</div>
+                <textarea
+                  className="field"
+                  rows={3}
+                  value={form.ko}
+                  onChange={(e) => updateForm("ko", e.target.value)}
+                  placeholder="예: 나중에요 / 지금은 좀 어렵습니다 / 애매한데요 / 미안해요 / 고마워요"
+                />
+              </div>
+
+              <div style={{ marginBottom: 14 }}>
+                <div className="label">메모</div>
+                <textarea
+                  className="field"
+                  rows={2}
+                  value={form.memo}
+                  onChange={(e) => updateForm("memo", e.target.value)}
+                  placeholder="맥락, 상대 반응, 내가 말하고 싶었던 의도 등"
+                />
+              </div>
+
+              <div className="cards">
+                <SuggestCard
+                  label="Good (무난/안전)"
+                  tag="good"
+                  value={suggestions.good}
+                  onChange={(v) => setSuggestions((p) => ({ ...p, good: v }))}
+                />
+                <SuggestCard
+                  label="More natural (더 자연)"
+                  tag="natural"
+                  value={suggestions.natural}
+                  onChange={(v) => setSuggestions((p) => ({ ...p, natural: v }))}
+                />
+                <SuggestCard
+                  label="Casual (캐주얼)"
+                  tag="casual"
+                  value={suggestions.casual}
+                  onChange={(v) => setSuggestions((p) => ({ ...p, casual: v }))}
+                />
+                <SuggestCard
+                  label="Don’t say (비추)"
+                  tag="dont"
+                  value={suggestions.dont}
+                  onChange={(v) => setSuggestions((p) => ({ ...p, dont: v }))}
+                  helper={suggestions.whyDont}
+                />
+              </div>
+
+              <div style={{ marginTop: 14, display: "flex", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
+                <div className="small">
+                  규칙 매칭 키워드: 애매/미묘 · 지금은 어렵 · 나중에 · 미안/죄송 · 고마/감사
+                </div>
+                <div className="btnRow">
+                  <button
+                    className="btn btnGhost"
+                    onClick={() => {
+                      // quick fill for testing
+                      setForm((p) => ({ ...p, ko: "나중에요", memo: "지금 당장은 답하기 싫었음" }));
+                      setToast({ type: "ok", msg: "예시 입력됨" });
+                    }}
+                  >
+                    예시 넣기
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Right: logs */}
+          <div ref={rightRef} className="panel">
+            <div className="panelHeader">
+              <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                <div style={{ fontWeight: 850 }}>로그</div>
+                <div className="small">최근 저장 순 · 복사/삭제</div>
+              </div>
+              <div className="btnRow">
+                <button className="btn" onClick={exportCSV} disabled={logs.length === 0}>
+                  CSV 내보내기
+                </button>
+                <button className="btn btnDanger" onClick={clearAll} disabled={logs.length === 0}>
+                  전체 삭제
+                </button>
+              </div>
+            </div>
+
+            <div className="panelBody">
+              {logs.length === 0 ? null : (
+                <div className="logList">
+                  {logs.map((x) => (
+                    <div key={x.id} className="logItem">
+                      <div className="logMeta">
+                        <span className="chip">{x.situation}</span>
+                        <span className="chip">{x.counterpart}</span>
+                        <span className="chip">{x.tone}</span>
+                        <span className="small" style={{ marginLeft: "auto" }}>
+                          {new Date(x.createdAt).toLocaleString()}
+                        </span>
+                      </div>
+
+                      <div className="logKo">{x.ko}</div>
+
+                      <div style={{ display: "grid", gap: 8 }}>
+                        {x.rec_good ? (
+                          <div className="logEn">
+                            <span style={{ color: theme.good, fontWeight: 800 }}>Good:</span> {x.rec_good}
+                          </div>
+                        ) : null}
+                        {x.rec_natural ? (
+                          <div className="logEn">
+                            <span style={{ color: theme.natural, fontWeight: 800 }}>Natural:</span> {x.rec_natural}
+                          </div>
+                        ) : null}
+                        {x.rec_casual ? (
+                          <div className="logEn">
+                            <span style={{ color: theme.casual, fontWeight: 800 }}>Casual:</span> {x.rec_casual}
+                          </div>
+                        ) : null}
+                        {x.rec_dont ? (
+                          <div className="logEn">
+                            <span style={{ color: theme.dont, fontWeight: 800 }}>Don’t:</span> {x.rec_dont}
+                          </div>
+                        ) : null}
+                        {x.dont_reason ? (
+                          <div className="logMemo">
+                            <span style={{ fontWeight: 750 }}>Don’t say 이유:</span> {x.dont_reason}
+                          </div>
+                        ) : null}
+                      </div>
+
+                      {x.memo ? <div className="logMemo">메모: {x.memo}</div> : null}
+
+                      <div className="btnRow" style={{ marginTop: 10 }}>
+                        <button
+                          className="btn"
+                          onClick={() =>
+                            copy(
+                              [
+                                `Korean: ${x.ko}`,
+                                x.rec_good ? `Good: ${x.rec_good}` : "",
+                                x.rec_natural ? `Natural: ${x.rec_natural}` : "",
+                                x.rec_casual ? `Casual: ${x.rec_casual}` : "",
+                                x.rec_dont ? `Don’t: ${x.rec_dont}` : "",
+                              ]
+                                .filter(Boolean)
+                                .join("\n")
+                            )
+                          }
+                        >
+                          복사
+                        </button>
+                        <button className="btn btnDanger" onClick={() => remove(x.id)}>
+                          삭제
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {toast ? (
+        <div className="toast" role="status" aria-live="polite">
+          <span
+            className="dot"
+            style={{ background: toast.type === "ok" ? theme.good : theme.casual }}
+          />
+          <span style={{ fontWeight: 750 }}>{toast.msg}</span>
+        </div>
+      ) : null}
+    </div>
+  );
+}
